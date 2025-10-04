@@ -20,8 +20,10 @@ if not api_key:
 
 client = OpenAI(api_key=api_key)
 
-st.set_page_config(page_title="Streamlit + OpenAI Chat + RAG", page_icon="💬")
-st.title("💬 Streamlit Chat + RAG")
+st.set_page_config(page_title="CA-GPT", page_icon="🏫")
+st.title("🏫 CA-GPT")
+
+st.subheader("Learn about Cary Academy without digging through documents, just through CA-GPT!")
 
 # Sidebar
 with st.sidebar:
@@ -50,7 +52,7 @@ if "chroma_ready" not in st.session_state:
     st.session_state.chroma_ready = True
 
 # Upload & index
-st.subheader("📄 Knowledge Base (RAG)")
+st.subheader("Knowledge Base (RAG)")
 uploads = st.file_uploader(
     "Add PDFs/TXT/MD", type=["pdf", "txt", "md"], accept_multiple_files=True
 )
