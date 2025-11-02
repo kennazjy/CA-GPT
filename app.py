@@ -3,7 +3,6 @@ import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 import requests
-from bs4 import BeautifulSoup
 
 # NEW
 from rag_utils import (
