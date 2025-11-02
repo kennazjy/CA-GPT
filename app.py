@@ -107,9 +107,9 @@ def show_user_info():
 load_dotenv()
 
 # App configuration - make it dynamic for different organizations
-app_name = st.secrets.get("APP_NAME", os.getenv("APP_NAME", "ECHO GPT"))
+app_name = st.secrets.get("APP_NAME", os.getenv("APP_NAME", "CA GPT"))
 app_icon = st.secrets.get("APP_ICON", os.getenv("APP_ICON", "💬"))
-organization_name = st.secrets.get("ORGANIZATION_NAME", os.getenv("ORGANIZATION_NAME", "ECHO"))
+organization_name = st.secrets.get("ORGANIZATION_NAME", os.getenv("ORGANIZATION_NAME", "Cary Academy"))
 
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not api_key:
