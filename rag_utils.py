@@ -1,31 +1,16 @@
-# rag_utils.py
-"""
-rag_utils.py — lightweight RAG utilities for Streamlit + OpenAI + Chroma
-"""
+import os, re, uuid, math
+from typing import List, Dict, Iterable, Tuple, Optional
+from openai import OpenAI
+import chromadb
+from chromadb.utils import embedding_functions
 
-from __future__ import annotations
-import os
-import re
-import uuid
-import time
-from typing import Iterable, List, Dict, Tuple, Optional
-
-# ----------------------------
-# Parsing & loaders
-# ----------------------------
-
-def _normalize_ws(s: str) -> str:
-    """Collapse whitespace to keep chunks compact."""
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
-
+# ---------- PDF loaders: streaming ----------
 def iter_pdf_text(path: str) -> Iterable[str]:
     """
-    Yield text per page. Tries PyMuPDF (fast) first, then pypdf.
-    Never loads the entire PDF into memory.
+    Yields plain text per page. Tries pymupdf first, falls back to pypdf.
     """
     try:
-        import fitz  # type: ignore
+        import fitz  # pymupdf
         with fitz.open(path) as doc:
             for page in doc:
                 yield page.get_text("text") or ""
@@ -33,203 +18,139 @@ def iter_pdf_text(path: str) -> Iterable[str]:
     except Exception:
         pass
 
+    # Fallback: pypdf
     try:
-        from pypdf import PdfReader  # type: ignore
+        from pypdf import PdfReader
         reader = PdfReader(path)
         for p in reader.pages:
             try:
                 yield p.extract_text() or ""
             except Exception:
                 yield ""
-    except Exception:
-        return
+    except Exception as e:
+        # last resort: treat as empty
+        yield ""
 
-
-def load_text_file(path: str) -> Iterable[str]:
-    """Yield the entire text file as one string (still streamed as an iterator)."""
+def load_text(path: str) -> Iterable[str]:
+    """
+    Yields one big chunk of text for .txt/.md files (still streamable).
+    """
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         yield f.read()
 
-
-def fetch_url_text(url: str) -> Iterable[str]:
-    """Yield cleaned visible text from a web page."""
-    try:
-        import requests
-        from bs4 import BeautifulSoup
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-        text = soup.get_text(separator=" ")
-        yield text
-    except Exception:
-        return
-
-
-def iter_any(path_or_url: str) -> Iterable[str]:
-    """Dispatch to the appropriate loader and yield text blocks."""
-    lower = path_or_url.lower()
-    if lower.startswith("http://") or lower.startswith("https://"):
-        yield from fetch_url_text(path_or_url)
-    elif lower.endswith(".pdf"):
-        yield from iter_pdf_text(path_or_url)
+def iter_any(path: str) -> Iterable[str]:
+    lower = path.lower()
+    if lower.endswith(".pdf"):
+        yield from iter_pdf_text(path)
     elif lower.endswith((".txt", ".md")):
-        yield from load_text_file(path_or_url)
+        yield from load_text(path)
     else:
-        yield from load_text_file(path_or_url)
+        yield from load_text(path)  # naive fallback
 
-# ----------------------------
-# Chunking
-# ----------------------------
+# ---------- Chunking (generator) ----------
+def normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
-def iter_chunks_from_pages(
-    pages: Iterable[str],
-    chunk_size: int = 900,
-    chunk_overlap: int = 140,
-) -> Iterable[str]:
-    """Stream chunks across page boundaries without building huge lists."""
+def iter_chunks_from_pages(pages: Iterable[str], chunk_size=1200, chunk_overlap=180) -> Iterable[str]:
+    """
+    Build chunks across page boundaries without loading the whole doc into memory.
+    """
     buf = ""
     for page in pages:
-        buf += " " + _normalize_ws(page)
+        buf += " " + normalize_ws(page)
         while len(buf) >= chunk_size + chunk_overlap:
             yield buf[:chunk_size]
             buf = buf[chunk_size - chunk_overlap:]
+    # flush remainder
     if buf:
         yield buf[:chunk_size]
 
-
-def estimate_chunk_count_from_path(
-    path_or_url: str,
-    chunk_size: int = 900,
-    chunk_overlap: int = 140,
-) -> int:
-    """Rough estimate of chunk count."""
-    return sum(
-        1 for _ in iter_chunks_from_pages(iter_any(path_or_url), chunk_size, chunk_overlap)
-    )
-
-# ----------------------------
-# Vector store (Chroma) setup
-# ----------------------------
-
+# ---------- Chroma setup ----------
 def get_chroma(persist_dir: str = ".chroma"):
-    """Return a PersistentClient (creates the folder on first use)."""
-    import chromadb
+    # auto-creates the directory on first use
     client = chromadb.PersistentClient(path=persist_dir)
     return client
 
-
-def get_collection(
-    client,
-    name: str = "docs",
-    openai_api_key: Optional[str] = None,
-    embedding_model: str = "text-embedding-3-small",
-):
-    """
-    Return (or create) a Chroma collection that uses OpenAI embeddings on the server side.
-    """
-    from chromadb.utils import embedding_functions
+def get_collection(client, name="docs", openai_api_key: str = None, embedding_model: str = "text-embedding-3-small"):
     ef = embedding_functions.OpenAIEmbeddingFunction(
         api_key=openai_api_key,
-        model_name=embedding_model,
+        model_name=embedding_model
     )
     return client.get_or_create_collection(name=name, embedding_function=ef)
 
-# ----------------------------
-# Ingestion (streaming + batching)
-# ----------------------------
-
+# ---------- Streaming ingest with batching ----------
 def ingest_files_streaming(
     file_paths: List[str],
     collection,
     *,
-    chunk_size: int = 900,
-    chunk_overlap: int = 140,
+    chunk_size: int = 1200,
+    chunk_overlap: int = 180,
     batch_size: int = 64,
-    precompute_embeddings: bool = True,
-    openai_client=None,                       # required if precompute_embeddings=True
+    precompute_embeddings: bool = False,
+    openai_client: Optional[OpenAI] = None,
     embedding_model: str = "text-embedding-3-small",
-    max_file_mb: int = 50,
-    progress_cb=None                          # optional: progress_cb(total_chunks_int)
+    max_file_mb: int = 200
 ) -> int:
     """
-    Stream pages -> stream chunks -> write to Chroma in batches.
+    Stream pages -> stream chunks -> add to Chroma in batches.
+    Optionally precompute embeddings (lets you tightly control batch size).
     """
     if precompute_embeddings and openai_client is None:
         raise ValueError("openai_client is required when precompute_embeddings=True")
 
     total = 0
-    ids: List[str] = []
-    docs: List[str] = []
-    metas: List[Dict] = []
+    ids, docs, metas = [], [], []
 
-    def _flush():
+    def flush():
         nonlocal ids, docs, metas, total
         if not docs:
             return
-        t0 = time.time()
         if precompute_embeddings:
+            # embed in the client to control batch size precisely
             emb = openai_client.embeddings.create(model=embedding_model, input=docs).data
             vectors = [e.embedding for e in emb]
             collection.add(ids=ids, documents=docs, metadatas=metas, embeddings=vectors)
         else:
+            # let Chroma's embedding function handle it
             collection.add(ids=ids, documents=docs, metadatas=metas)
-        dt = time.time() - t0
         total += len(docs)
-        print(f"[flush] wrote {len(docs)} chunks in {dt:.2f}s (total={total})", flush=True)
-        if progress_cb:
-            try:
-                progress_cb(total)
-            except Exception:
-                pass
         ids, docs, metas = [], [], []
 
     for path in file_paths:
-        # Skip huge local files
-        if not (path.lower().startswith("http://") or path.lower().startswith("https://")):
-            try:
-                sz_mb = os.path.getsize(path) / (1024 * 1024)
-                if sz_mb > max_file_mb:
-                    print(f"[skip] {os.path.basename(path)} {sz_mb:.1f}MB > {max_file_mb}MB", flush=True)
-                    continue
-            except Exception:
-                pass
+        # skip huge files defensively
+        try:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            if size_mb > max_file_mb:
+                # you could show a warning in Streamlit instead
+                print(f"Skipping {os.path.basename(path)} ({size_mb:.1f} MB > {max_file_mb} MB).")
+                continue
+        except Exception:
+            pass
 
-        print(f"[parse] {os.path.basename(path) if '://' not in path else path} …", flush=True)
-        t_parse = time.time()
-        cnt = 0
-        for i, chunk in enumerate(iter_chunks_from_pages(iter_any(path), chunk_size, chunk_overlap)):
+        page_iter = iter_any(path)
+        chunk_iter = iter_chunks_from_pages(page_iter, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+        for i, chunk in enumerate(chunk_iter):
             ids.append(str(uuid.uuid4()))
             docs.append(chunk)
-            metas.append({"source": os.path.basename(path) if os.path.exists(path) else path, "chunk": i})
-            cnt += 1
+            metas.append({"source": os.path.basename(path), "chunk": i})
             if len(docs) >= batch_size:
-                _flush()
-        _flush()
-        print(f"[parsed] {cnt} chunks in {time.time() - t_parse:.2f}s", flush=True)
+                flush()
+
+        # flush end-of-file
+        flush()
 
     return total
 
-# ----------------------------
-# Retrieval & answering
-# ----------------------------
-
-def retrieve(query: str, collection, k: int = 5) -> List[Tuple[str, Dict]]:
-    """Return list of (document_text, metadata) pairs for top-k results."""
+# ---------- Retrieval & answering ----------
+def retrieve(query: str, collection, k: int = 5):
     res = collection.query(query_texts=[query], n_results=k)
     docs = res.get("documents", [[]])[0]
     metas = res.get("metadatas", [[]])[0]
     return list(zip(docs, metas))
 
-
-def build_context_snippets(
-    pairs: List[Tuple[str, Dict]],
-    max_chars: int = 3000
-) -> str:
-    """Assemble a compact context blob with lightweight inline citations."""
-    blobs: List[str] = []
-    used = 0
+def build_context_snippets(pairs: List[Tuple[str, Dict]], max_chars=3000):
+    blobs, used = [], 0
     for doc, meta in pairs:
         tag = f"[{meta.get('source','unknown')}#chunk{meta.get('chunk',0)}]"
         piece = f"{tag}\n{doc}\n"
@@ -239,53 +160,12 @@ def build_context_snippets(
         used += len(piece)
     return "\n---\n".join(blobs)
 
-
-def answer_with_context(
-    openai_client,
-    model: str,
-    system_prompt: str,
-    user_query: str,
-    context_blob: str
-) -> str:
-    """Minimal answering helper using chat.completions."""
+def answer_with_context(client: OpenAI, model: str, system_prompt: str, user_query: str, context_blob: str) -> str:
     messages = [
         {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                "Answer ONLY using the context below. If the answer is not present, say "
-                "'I don’t see this in the provided documents.'\n\n"
-                f"### Context\n{context_blob}\n\n### Question\n{user_query}"
-            ),
-        },
+        {"role": "user", "content":
+         f"Use the following context to answer. If the answer isn't in the context, say so briefly.\n\n"
+         f"### Context\n{context_blob}\n\n### Question\n{user_query}"}
     ]
-    resp = openai_client.chat.completions.create(model=model, messages=messages)
+    resp = client.chat.completions.create(model=model, messages=messages)
     return resp.choices[0].message.content.strip()
-
-# ----------------------------
-# Optional helpers
-# ----------------------------
-
-def clear_collection(collection) -> None:
-    """Delete all docs from a Chroma collection (careful!)."""
-    try:
-        collection.delete(ids=collection.get()["ids"])
-    except Exception:
-        try:
-            collection.delete(where={})
-        except Exception:
-            pass
-
-
-__all__ = [
-    "get_chroma",
-    "get_collection",
-    "iter_any",
-    "iter_chunks_from_pages",
-    "estimate_chunk_count_from_path",
-    "ingest_files_streaming",
-    "retrieve",
-    "build_context_snippets",
-    "answer_with_context",
-    "clear_collection",
-]
