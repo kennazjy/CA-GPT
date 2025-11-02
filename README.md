@@ -38,19 +38,6 @@ A flexible, organization-ready GPT tool built with Streamlit and OpenAI that can
 
 ## Customization
 
-### Environment Variables
-
-Configure your app by setting these environment variables in `.env`:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `OPENAI_API_KEY` | Your OpenAI API key (required) | - |
-| `ADMIN_USERNAME` | Admin username for accessing admin features | "admin" |
-| `ADMIN_PASSWORD` | Admin password for accessing admin features | "admin123" |
-| `APP_NAME` | Display name for your GPT tool | "ECHO GPT" |
-| `APP_ICON` | Emoji icon for your app | "💬" |
-| `ORGANIZATION_NAME` | Your organization's name | "ECHO" |
-
 ### Example Configurations
 
 **Healthcare Organization:**
